@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::fs::File;
 /// Inference for GGUF Qwen-3 models in pure Rust
 use std::io::{self, BufRead};
@@ -93,17 +94,17 @@ impl RunState {
     }
 }
 
-impl TransformerWeights {
-    pub fn mmap(p: Config) -> Self {
-        let file = File::open("model.gguf")?;
-        let gguf = GGUFFile::read(file)?;
+// impl TransformerWeights {
+//     pub fn mmap(p: Config) -> Self {
+//         let file = File::open("model.gguf")?;
+//         let gguf = GGUFFile::read(file)?;
 
-        Self {}
-    }
-}
+//         Self {}
+//     }
+// }
 
 impl Config {
-    fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
+    fn read_lines<P>(filename: P) -> io::Lines<io::BufReader<File>>
     where
         P: AsRef<Path> + std::fmt::Display,
     {
@@ -114,15 +115,116 @@ impl Config {
                 std::process::exit(1);
             }
         };
-        Ok(io::BufReader::new(file).lines())
+        io::BufReader::new(file).lines()
     }
 
     pub fn load(filename: Option<String>) -> Self {
         let filename = filename.unwrap_or_else(|| "header.txt".to_string());
 
-        let file = Self::read_lines(filename);
+        let lines = Self::read_lines(filename);
+        let mut config: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
 
-        Self {}
+        let format_parsing_error_message = |key: &str, value: &str| {
+            format!("Error parsing value '{}' as usize for key {}", value, key)
+        };
+
+        for line in lines.map_while(Result::ok) {
+            match line.split_once("=") {
+                Some((key, value)) => match key {
+                    "QWEN3_EMBEDDING_LENGTH" => {
+                        config.insert(
+                            "dim",
+                            value
+                                .parse::<usize>()
+                                .expect(&format_parsing_error_message(key, value)),
+                        );
+                    }
+                    "QWEN3_FEED_FORWARD_LENGTH" => {
+                        config.insert(
+                            "hidden_dim",
+                            value
+                                .parse::<usize>()
+                                .expect(&format_parsing_error_message(key, value)),
+                        );
+                    }
+                    "QWEN3_BLOCK_COUNT" => {
+                        config.insert(
+                            "n_layers",
+                            value
+                                .parse::<usize>()
+                                .expect(&format_parsing_error_message(key, value)),
+                        );
+                    }
+                    "QWEN3_ATTENTION_HEAD_COUNT" => {
+                        config.insert(
+                            "n_heads",
+                            value
+                                .parse::<usize>()
+                                .expect(&format_parsing_error_message(key, value)),
+                        );
+                    }
+                    "QWEN3_ATTENTION_HEAD_COUNT_KV" => {
+                        config.insert(
+                            "n_kv_heads",
+                            value
+                                .parse::<usize>()
+                                .expect(&format_parsing_error_message(key, value)),
+                        );
+                    }
+                    "QWEN3_CONTEXT_LENGTH" => {
+                        config.insert(
+                            "seq_len",
+                            value
+                                .parse::<usize>()
+                                .expect(&format_parsing_error_message(key, value)),
+                        );
+                    }
+                    "QWEN3_ATTENTION_KEY_LENGTH" => {
+                        config.insert(
+                            "head_dim",
+                            value
+                                .parse::<usize>()
+                                .expect(&format_parsing_error_message(key, value)),
+                        );
+                    }
+                    "TOKENIZER_GGML_TOKENS" => {
+                        const ARRAY_LENGTH_KEY: &str = "ARRAY_LENGTH=";
+
+                        if let Some(start) = value.find(ARRAY_LENGTH_KEY) {
+                            let start = start + ARRAY_LENGTH_KEY.len();
+                            let value = value[start..].to_string();
+                            config.insert(
+                                "vocab_size",
+                                value
+                                    .parse::<usize>()
+                                    .expect(&format_parsing_error_message(key, &value)),
+                            );
+                        } else {
+                            eprintln!("No key named '{}' found in config", ARRAY_LENGTH_KEY);
+                            std::process::exit(1);
+                        }
+                    }
+                    _ => {}
+                },
+                None => {}
+            }
+        }
+
+        if config.len() != 8 {
+            eprintln!("Invalid or corrupted config, didn't find exactly eight keys");
+            std::process::exit(1);
+        }
+
+        Self {
+            dim: config["dim"],
+            hidden_dim: config["hidden_dim"],
+            n_layers: config["n_layers"],
+            n_heads: config["n_heads"],
+            n_kv_heads: config["n_kv_heads"],
+            seq_len: config["seq_len"],
+            head_dim: config["head_dim"],
+            vocab_size: config["vocab_size"],
+        }
     }
 }
 
@@ -157,7 +259,12 @@ mod read_da_lines {
         // File hosts.txt must exist in the current path
         if let Ok(lines) = read_lines("./main.rs") {
             for line in lines.map_while(Result::ok) {
-                println!("{}", line);
+                match line.split_once("=") {
+                    Some((key, value)) => {
+                        println!("key = {}, value = {}", key, value);
+                    }
+                    None => {}
+                };
             }
         }
     }
@@ -173,4 +280,18 @@ mod read_da_lines {
 
 fn main() {
     println!("hello world");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_load() {
+        let config = Config::load(Some("header.txt".to_string()));
+
+        println!("{:?}", config);
+
+        assert!(true);
+    }
 }
