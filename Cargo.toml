@@ -1,0 +1,17 @@
+[package]
+name = "qwen3-rs"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "qwen3"
+source = "src/lib.rs"
+
+[[bin]]
+name = "qwen3-rs"
+source = "src/main.rs"
+
+[dependencies]
+memmapix = "0.7.6"
+
+
