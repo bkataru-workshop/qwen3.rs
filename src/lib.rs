@@ -1,3 +1,4 @@
+use memmapix::Mmap;
 use std::any::Any;
 use std::fs::File;
 /// Inference for GGUF Qwen-3 models in pure Rust
@@ -66,7 +67,8 @@ struct Transformer {
     config: Config,              // the hyperparameters of the architecture (the blueprint)
     weights: TransformerWeights, // the weights of the model
     state: RunState,             // buffers for the "wave" of activations in the forward pass
-    fd: i32,                     // file descriptor for memory mapping
+    fd: File,                    // file handler for memory mapping
+    _mmap: Mmap,                 // keep mmap alive; dropping it unmaps the file
     data: Box<[f32]>,            // memory mapped data pointer
     file_size: isize,            // size of the checkpoint file in bytes
 }
@@ -90,6 +92,36 @@ impl RunState {
             logits: vec![0.0; p.vocab_size].into_boxed_slice(),
             key_cache: vec![0.0; p.n_layers * p.seq_len * kv_dim].into_boxed_slice(),
             value_cache: vec![0.0; p.n_layers * p.seq_len * kv_dim].into_boxed_slice(),
+        }
+    }
+}
+
+impl TransformerWeights {
+    /// Memory map weights from a byte slice at a given offset
+    pub fn mmap(
+        data: &[u8],
+        config: &Config,
+        header_offset: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Reinterpret the byte slice as f32 slice
+        let float_data = bytes_as_floats(&data[header_offset..])?;
+        let mut offset = 0;
+
+        macro_rules! consume {}
+    }
+
+    fn bytes_as_floats(data: &[u8]) -> Result<&[f32], Box<dyn std::error::Error>> {
+        if data.len() % 4 != 0 {
+            return Err("Byte slice length must be a multiple of 4".into());
+        }
+        if data.as_ptr() as usize % 4 != 0 {
+            return Err("Data is not 4-byte aligned".into());
+        }
+
+        unsafe {
+            let ptr = data.as_ptr() as *const f32;
+            let len = data.len() / 4;
+            Ok(std::slice::from_raw_parts(ptr, len))
         }
     }
 }
@@ -247,34 +279,6 @@ mod how_to_memory_map {
         assert_eq!(&contents[..], &mmap[..]);
 
         Ok(())
-    }
-}
-
-mod read_da_lines {
-    use std::fs::File;
-    use std::io::{self, BufRead};
-    use std::path::Path;
-
-    fn main() {
-        // File hosts.txt must exist in the current path
-        if let Ok(lines) = read_lines("./main.rs") {
-            for line in lines.map_while(Result::ok) {
-                match line.split_once("=") {
-                    Some((key, value)) => {
-                        println!("key = {}, value = {}", key, value);
-                    }
-                    None => {}
-                };
-            }
-        }
-    }
-
-    fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
-    where
-        P: AsRef<Path>,
-    {
-        let file = File::open(filename)?;
-        Ok(io::BufReader::new(file).lines())
     }
 }
 
