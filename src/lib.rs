@@ -4,10 +4,11 @@ use std::fs::File;
 /// Inference for GGUF Qwen-3 models in pure Rust
 use std::io::{self, BufRead};
 use std::path::Path;
+use std::str::RSplitTerminator;
 
 // ----------------------------------------------------------------------------
 // Transformer model
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 struct Config {
     dim: usize,        // transformer dimension
     hidden_dim: usize, // for ffn layers
@@ -69,8 +70,8 @@ struct Transformer {
     state: RunState,             // buffers for the "wave" of activations in the forward pass
     fd: File,                    // file handler for memory mapping
     _mmap: Mmap,                 // keep mmap alive; dropping it unmaps the file
-    data: Box<[f32]>,            // memory mapped data pointer
-    file_size: isize,            // size of the checkpoint file in bytes
+    // data: Box<[f32]>,            // memory mapped data pointer
+    file_size: u64, // size of the checkpoint file in bytes
 }
 
 impl RunState {
@@ -104,10 +105,36 @@ impl TransformerWeights {
         header_offset: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Reinterpret the byte slice as f32 slice
-        let float_data = bytes_as_floats(&data[header_offset..])?;
+        let float_data = Self::bytes_as_floats(&data[header_offset..])?;
         let mut offset = 0;
 
-        macro_rules! consume {}
+        macro_rules! consume {
+            ($name:expr, $len:expr) => {{
+                let slice = &float_data[offset..offset + $len];
+                offset += $len;
+                slice.to_vec().into_boxed_slice()
+            }};
+        }
+
+        Ok(Self {
+            wcls: consume!("wcls", config.vocab_size * config.dim),
+            rms_final_weight: consume!("rms_final_weight", config.dim),
+            token_embedding_table: consume!(
+                "token_embedding_table",
+                config.vocab_size * config.dim
+            ),
+            wk: consume!("wk", config.dim * config.n_kv_heads * config.head_dim),
+            wk_norm: consume!("wk_norm", config.head_dim),
+            rms_att_weight: consume!("rms_att_weight", config.dim),
+            wo: consume!("wo", config.n_heads * config.head_dim * config.dim),
+            wq: consume!("wq", config.dim * config.n_heads * config.head_dim),
+            wq_norm: consume!("wq_norm", config.head_dim),
+            wv: consume!("wv", config.dim * config.n_kv_heads * config.head_dim),
+            w2: consume!("w2", config.hidden_dim * config.dim),
+            w3: consume!("w3", config.dim * config.hidden_dim),
+            rms_ffn_weight: consume!("rms_ffn_weight", config.dim),
+            w1: consume!("w1", config.dim * config.hidden_dim),
+        })
     }
 
     fn bytes_as_floats(data: &[u8]) -> Result<&[f32], Box<dyn std::error::Error>> {
@@ -126,14 +153,44 @@ impl TransformerWeights {
     }
 }
 
-// impl TransformerWeights {
-//     pub fn mmap(p: Config) -> Self {
-//         let file = File::open("model.gguf")?;
-//         let gguf = GGUFFile::read(file)?;
+impl Transformer {
+    // read GGUF
+    pub fn read_checkpoint(
+        checkpoint_path: &str,
+        config: &mut Config,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let file = File::open(checkpoint_path)?;
+        let file_size = file.metadata()?.len();
 
-//         Self {}
-//     }
-// }
+        // Memory map the file
+        let mmap = unsafe { Mmap::map(&file)? };
+
+        // Skip GGUF header (hardcoded for now, but parse it properly later)
+        let header_offset = 5951648;
+
+        let weights = TransformerWeights::mmap(&mmap, config, header_offset)?;
+        let state = RunState::calloc(*config);
+
+        Ok(Self {
+            config: *config,
+            weights,
+            state,
+            fd: file,
+            _mmap: mmap, // Keep the mmap alive
+            file_size,
+        })
+    }
+
+    pub fn build(checkpoint_path: &str, config: &mut Config) -> Self {
+        match Self::read_checkpoint(checkpoint_path, config) {
+            Ok(transformer) => transformer,
+            Err(error) => {
+                eprintln!("Error building Transformer: {}", error);
+                std::process::exit(1);
+            }
+        }
+    }
+}
 
 impl Config {
     fn read_lines<P>(filename: P) -> io::Lines<io::BufReader<File>>
@@ -150,6 +207,7 @@ impl Config {
         io::BufReader::new(file).lines()
     }
 
+    // load the GGUF config file
     pub fn load(filename: Option<String>) -> Self {
         let filename = filename.unwrap_or_else(|| "header.txt".to_string());
 
