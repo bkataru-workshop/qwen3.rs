@@ -322,17 +322,62 @@ impl Config {
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
-pub fn rmsnorm(x: &[f32], weight: &[f32], size: usize) -> &[f32] {
+pub fn rmsnorm(mut x: Vec<f32>, weight: &[f32], size: usize) -> Vec<f32> {
     // calculate sum of squares
-    let mut ss = 0.0_f32;
-    for j in 0..size {
-        ss += x[j] * x[j];
-    }
-    ss /= size;
-    ss += 1e-6_f32;
-    ss = 1.0_f32 / ss.sqrt();
+    // iterator enables auto-vectorization
+    let ss = x.iter().map(|&v| v * v).sum::<f32>() / size as f32 + 1e-6;
+    let scale = 1.0 / ss.sqrt();
+
     // normalize and scale
-    for j in 0..size {}
+    // in-place for cache efficiency
+    for j in 0..size.min(x.len()) {
+        x[j] *= scale * weight[j];
+    }
+    x.truncate(size);
+    x
+}
+
+pub fn softmax(mut x: Vec<f32>, size: usize) -> Vec<f32> {
+    // find max value (for numerical stability)
+    let max_val = x
+        .iter()
+        .max_by(|a, b| a.total_cmp(b))
+        .copied()
+        .unwrap_or(f32::NAN);
+
+    // exp and sum
+    // TODO: what about this? how does an iterator-based approach compare
+    // x = x.iter().map(|c| (c - max_val).exp()).collect();
+    for i in 0..size.min(x.len()) {
+        x[i] = (x[i] - max_val).exp();
+    }
+    let sum = x.iter().sum::<f32>();
+
+    // normalize
+    for i in 0..size.min(x.len()) {
+        x[i] /= sum;
+    }
+    x.truncate(size);
+    x
+}
+
+pub fn matmul(x: &[f32], w: &[f32], n: usize, d: usize) -> Vec<f32> {
+    // W (d,n) @ x (n,) -> xout (d,)
+    // by far the most amount of time is spent inside this little function
+    // TODO:
+    // the C version parallelizes using OpenMP via
+    // #pragma omp parallel for private(i)
+    // figure out how to do this in Rust
+
+    let mut xout = vec![0.0_f32; d];
+    for i in 0..d {
+        let mut val = 0.0_f32;
+        for j in 0..n {
+            val += w[i * n + j] * x[j];
+        }
+        xout[i] = val;
+    }
+    xout
 }
 
 fn main() {
