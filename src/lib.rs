@@ -1,6 +1,7 @@
 use memmapix::Mmap;
 use std::any::Any;
 use std::fs::File;
+use std::intrinsics::sqrtf32;
 /// Inference for GGUF Qwen-3 models in pure Rust
 use std::io::{self, BufRead};
 use std::path::Path;
@@ -318,26 +319,20 @@ impl Config {
     }
 }
 
-mod how_to_memory_map {
-    use std::fs::File;
-    use std::io::Read;
+// ----------------------------------------------------------------------------
+// neural net blocks; the dynamics of the Transformer
 
-    use memmapix::Mmap;
-
-    fn main() -> Result<(), Box<dyn std::error::Error>> {
-        let mut file = File::open("./main.rs")?;
-
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents)?;
-
-        let mmap = unsafe { Mmap::map(&file)? };
-
-        let foo = &mmap[..];
-
-        assert_eq!(&contents[..], &mmap[..]);
-
-        Ok(())
+pub fn rmsnorm(x: &[f32], weight: &[f32], size: usize) -> &[f32] {
+    // calculate sum of squares
+    let mut ss = 0.0_f32;
+    for j in 0..size {
+        ss += x[j] * x[j];
     }
+    ss /= size;
+    ss += 1e-6_f32;
+    ss = 1.0_f32 / ss.sqrt();
+    // normalize and scale
+    for j in 0..size {}
 }
 
 fn main() {
