@@ -1,6 +1,7 @@
 # qwen3.rs
 
 > grug 1: qwen3 GGUF inference in crab lang
+
 > grug 2: wow shiny
 
 Fast and efficient Rust inference for Qwen3 GGUF with the smallest (0.6B) at the fullest (FP32)
