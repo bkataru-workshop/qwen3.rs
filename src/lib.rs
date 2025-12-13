@@ -1,11 +1,8 @@
 use memmapix::Mmap;
-use std::any::Any;
 use std::fs::File;
-use std::intrinsics::sqrtf32;
 /// Inference for GGUF Qwen-3 models in pure Rust
 use std::io::{self, BufRead};
 use std::path::Path;
-use std::str::RSplitTerminator;
 
 // ----------------------------------------------------------------------------
 // Transformer model
