@@ -19,28 +19,28 @@ struct Config {
     head_dim: usize,   // attention dimension
 }
 
-#[derive(Debug)]
-struct TransformerWeights {
+#[derive(Debug, Clone, Copy)]
+struct TransformerWeights<'a> {
     // token embedding table
-    token_embedding_table: Box<[f32]>, // (vocab_size, dim)
+    token_embedding_table: &'a [f32], // (vocab_size, dim)
     // weights for rmsnorms in each layer
-    rms_att_weight: Box<[f32]>, // (layer, dim)
-    rms_ffn_weight: Box<[f32]>, // (layer, dim)
+    rms_att_weight: &'a [f32], // (layer, dim)
+    rms_ffn_weight: &'a [f32], // (layer, dim)
     // weights for matmuls
-    wq: Box<[f32]>,      // (layer, dim, n_heads * head_dim)
-    wk: Box<[f32]>,      // (layer, dim, n_kv_heads * head_dim)
-    wv: Box<[f32]>,      // (layer, dim, n_kv_heads * head_dim)
-    wo: Box<[f32]>,      // (layer, n_heads * head_dim, dim)
-    wq_norm: Box<[f32]>, // (layer, head_dim)
-    wk_norm: Box<[f32]>, // (layer, head_dim)
+    wq: &'a [f32],      // (layer, dim, n_heads * head_dim)
+    wk: &'a [f32],      // (layer, dim, n_kv_heads * head_dim)
+    wv: &'a [f32],      // (layer, dim, n_kv_heads * head_dim)
+    wo: &'a [f32],      // (layer, n_heads * head_dim, dim)
+    wq_norm: &'a [f32], // (layer, head_dim)
+    wk_norm: &'a [f32], // (layer, head_dim)
     // weights for ffn. w1 = up, w3 = gate, w2 = down
-    w1: Box<[f32]>, // (layer, dim, hidden_dim)
-    w2: Box<[f32]>, // (layer, hidden_dim, dim)
-    w3: Box<[f32]>, // (layer, dim, hidden_dim)
+    w1: &'a [f32], // (layer, dim, hidden_dim)
+    w2: &'a [f32], // (layer, hidden_dim, dim)
+    w3: &'a [f32], // (layer, dim, hidden_dim)
     // final rmsnorm
-    rms_final_weight: Box<[f32]>, // (dim,)
+    rms_final_weight: &'a [f32], // (dim,)
     // Same as token_embedding_table. GGUF has the final layer anyway
-    wcls: Box<[f32]>,
+    wcls: &'a [f32],
 }
 
 #[derive(Debug)]
@@ -64,11 +64,11 @@ struct RunState {
 
 #[derive(Debug)]
 struct Transformer {
-    config: Config,              // the hyperparameters of the architecture (the blueprint)
-    weights: TransformerWeights, // the weights of the model
-    state: RunState,             // buffers for the "wave" of activations in the forward pass
-    fd: File,                    // file handler for memory mapping
-    _mmap: Mmap,                 // keep mmap alive; dropping it unmaps the file
+    config: Config, // the hyperparameters of the architecture (the blueprint)
+    weights: TransformerWeights<'static>, // the weights of the model, unsafe lifetime extension tied to owned _mmap
+    state: RunState, // buffers for the "wave" of activations in the forward pass
+    fd: File,        // file handler for memory mapping
+    _mmap: Mmap,     // keep mmap alive; dropping it unmaps the file
     // data: Box<[f32]>,            // memory mapped data pointer
     file_size: u64, // size of the checkpoint file in bytes
 }
@@ -96,10 +96,10 @@ impl RunState {
     }
 }
 
-impl TransformerWeights {
+impl<'a> TransformerWeights<'a> {
     /// Memory map weights from a byte slice at a given offset
     pub fn mmap(
-        data: &[u8],
+        data: &'a [u8],
         config: &Config,
         header_offset: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -107,36 +107,34 @@ impl TransformerWeights {
         let float_data = Self::bytes_as_floats(&data[header_offset..])?;
         let mut offset = 0;
 
-        macro_rules! consume {
-            ($name:expr, $len:expr) => {{
-                let slice = &float_data[offset..offset + $len];
-                offset += $len;
-                slice.to_vec().into_boxed_slice()
-            }};
-        }
+        let mut consume = |len: usize| -> Result<&'a [f32], Box<dyn std::error::Error>> {
+            if offset + len > float_data.len() {
+                return Err("Attempted to slice past mapped binary boundary".into());
+            }
+            let slice = &float_data[offset..offset + len];
+            offset += len;
+            Ok(slice)
+        };
 
         Ok(Self {
-            wcls: consume!("wcls", config.vocab_size * config.dim),
-            rms_final_weight: consume!("rms_final_weight", config.dim),
-            token_embedding_table: consume!(
-                "token_embedding_table",
-                config.vocab_size * config.dim
-            ),
-            wk: consume!("wk", config.dim * config.n_kv_heads * config.head_dim),
-            wk_norm: consume!("wk_norm", config.head_dim),
-            rms_att_weight: consume!("rms_att_weight", config.dim),
-            wo: consume!("wo", config.n_heads * config.head_dim * config.dim),
-            wq: consume!("wq", config.dim * config.n_heads * config.head_dim),
-            wq_norm: consume!("wq_norm", config.head_dim),
-            wv: consume!("wv", config.dim * config.n_kv_heads * config.head_dim),
-            w2: consume!("w2", config.hidden_dim * config.dim),
-            w3: consume!("w3", config.dim * config.hidden_dim),
-            rms_ffn_weight: consume!("rms_ffn_weight", config.dim),
-            w1: consume!("w1", config.dim * config.hidden_dim),
+            wcls: consume(config.vocab_size * config.dim)?,
+            rms_final_weight: consume(config.dim)?,
+            token_embedding_table: consume(config.vocab_size * config.dim)?,
+            wk: consume(config.n_layers * config.dim * config.n_kv_heads * config.head_dim)?,
+            wk_norm: consume(config.n_layers * config.head_dim)?,
+            rms_att_weight: consume(config.n_layers * config.dim)?,
+            wo: consume(config.n_layers * config.n_heads * config.head_dim * config.dim)?,
+            wq: consume(config.n_layers * config.dim * config.n_heads * config.head_dim)?,
+            wq_norm: consume(config.n_layers * config.head_dim)?,
+            wv: consume(config.n_layers * config.dim * config.n_kv_heads * config.head_dim)?,
+            w2: consume(config.n_layers * config.hidden_dim * config.dim)?,
+            w3: consume(config.n_layers * config.dim * config.hidden_dim)?,
+            rms_ffn_weight: consume(config.n_layers * config.dim)?,
+            w1: consume(config.n_layers * config.dim * config.hidden_dim)?,
         })
     }
 
-    fn bytes_as_floats(data: &[u8]) -> Result<&[f32], Box<dyn std::error::Error>> {
+    fn bytes_as_floats(data: &'a [u8]) -> Result<&'a [f32], Box<dyn std::error::Error>> {
         if data.len() % 4 != 0 {
             return Err("Byte slice length must be a multiple of 4".into());
         }
@@ -167,7 +165,12 @@ impl Transformer {
         // Skip GGUF header (hardcoded for now, but parse it properly later)
         let header_offset = 5951648;
 
-        let weights = TransformerWeights::mmap(&mmap, config, header_offset)?;
+        // Erase lifetime safely: `mmap` is stored permanently in `Transformer`
+        // and will outlive `weights`.
+        let static_bytes: &'static [u8] =
+            unsafe { std::slice::from_raw_parts(mmap.as_ptr(), mmap.len()) };
+
+        let weights = TransformerWeights::mmap(static_bytes, config, header_offset)?;
         let state = RunState::calloc(*config);
 
         Ok(Self {
