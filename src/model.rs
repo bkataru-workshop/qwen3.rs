@@ -1,7 +1,6 @@
 use memmapix::Mmap;
-use rayon::prelude::*;
-use std::fs::File;
 /// Inference for GGUF Qwen-3 models in pure Rust
+use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
 
@@ -69,7 +68,7 @@ struct Transformer {
     state: RunState,             // buffers for the "wave" of activations in the forward pass
     fd: File,                    // file handler for memory mapping
     _mmap: Mmap,                 // keep mmap alive; dropping it unmaps the file
-    // data: Box<[f32]>,            // memory mapped data pointer
+    // data: Box<[f32]>,           // memory mapped data pointer
     file_size: u64, // size of the checkpoint file in bytes
 }
 
@@ -129,10 +128,10 @@ impl TransformerWeights {
             wq: consume!("wq", config.dim * config.n_heads * config.head_dim),
             wq_norm: consume!("wq_norm", config.head_dim),
             wv: consume!("wv", config.dim * config.n_kv_heads * config.head_dim),
-            w2: consume!("w2", config.hidden_dim * config.dim),
+            w1: consume!("w1", config.dim * config.hidden_dim),
+            w2: consume!("w2", config.dim * config.hidden_dim),
             w3: consume!("w3", config.dim * config.hidden_dim),
             rms_ffn_weight: consume!("rms_ffn_weight", config.dim),
-            w1: consume!("w1", config.dim * config.hidden_dim),
         })
     }
 
@@ -164,7 +163,7 @@ impl Transformer {
         // Memory map the file
         let mmap = unsafe { Mmap::map(&file)? };
 
-        // Skip GGUF header (hardcoded for now, but parse it properly later)
+        // Skip GGUF header (hardcoded for now, parse it properly later)
         let header_offset = 5951648;
 
         let weights = TransformerWeights::mmap(&mmap, config, header_offset)?;
@@ -186,97 +185,6 @@ impl Transformer {
             Err(error) => {
                 eprintln!("Error building Transformer: {}", error);
                 std::process::exit(1);
-            }
-        }
-    }
-
-    pub fn forward(&mut self, token: usize, pos: usize) {
-        let config = &self.config;
-        let weights = &self.weights;
-        let state = &mut self.state;
-
-        let kv_dim = config.n_kv_heads * config.head_dim;
-        let kv_mul = config.n_heads / config.n_kv_heads;
-        let att_head_dim = config.n_heads * config.head_dim;
-
-        let layer_offset = 62923776 / 4; // offset to the GGUF next layer for the same tensor type TODO
-
-        let start = token * config.dim;
-        let end = start + config.dim;
-
-        // copy the token embedding into s->x, STARTING POINT - x is passing through.
-        state.x[..config.dim].copy_from_slice(&weights.token_embedding_table[start..end]);
-
-        // forward all the layers
-        for l in 0..config.n_layers {
-            // kv cache
-            let loff = l * config.seq_len * kv_dim;
-            let cache_idx = loff + pos * kv_dim;
-            let w_off = l * layer_offset;
-
-            // attention rmsnorm
-            state.xb.copy_from_slice(&state.x);
-            rmsnorm(&mut state.xb, &weights.rms_att_weight[w_off..], config.dim);
-
-            // query projection
-            matmul(
-                &mut state.q,
-                &state.xb,
-                &weights.wq[w_off..],
-                config.dim,
-                att_head_dim,
-            );
-
-            // mutable sub-slices of the KV cache for this specific layer/token
-            let k_slice = &mut state.key_cache[cache_idx..cache_idx + kv_dim];
-            let v_slice = &mut state.value_cache[cache_idx..cache_idx + kv_dim];
-
-            // key/value projections
-            matmul(k_slice, &state.xb, &weights.wk[w_off..], config.dim, kv_dim);
-            matmul(v_slice, &state.xb, &weights.wv[w_off..], config.dim, kv_dim);
-
-            // RoPE relative positional encoding
-            for h in 0..config.n_heads {
-                // query head
-                let q_start = h * config.head_dim;
-                let q_head = &mut state.q[q_start..q_start + config.head_dim];
-
-                // key head (conditionally)
-                let mut k_head = if h < config.n_kv_heads {
-                    let k_start = h * config.head_dim;
-                    Some(&mut k_slice[k_start..k_start + config.head_dim])
-                } else {
-                    None
-                };
-
-                // apply RMSNorm to query head
-                rmsnorm(q_head, &weights.wq_norm[w_off..], config.head_dim);
-
-                // apply RMSNorm to key head if within n_kv_heads
-                if let Some(ref mut k) = k_head {
-                    rmsnorm(k, &weights.wk_norm[w_off..], config.head_dim);
-                }
-
-                // apply rotary position encoding
-                for i in 0..(config.head_dim / 2) {
-                    let freq = 1.0 / 1000000.0_f32.powf(i as f32 / (config.head_dim as f32 / 2.0));
-                    let fcr = (pos as f32 * freq).cos();
-                    let fci = (pos as f32 * freq).sin();
-
-                    // rotate query head
-                    let x_q = q_head[i];
-                    let y_q = q_head[i + config.head_dim / 2];
-                    q_head[i] = x_q * fcr - y_q * fci;
-                    q_head[i + config.head_dim / 2] = x_q * fci + y_q * fcr;
-
-                    // rotate key head if within n_kv_heads
-                    if let Some(ref mut k) = k_head {
-                        let x_k = k[i];
-                        let y_k = k[i + config.head_dim / 2];
-                        k[i] = x_k * fcr - y_k * fci;
-                        k[i + config.head_dim / 2] = x_k * fci + y_k * fcr;
-                    }
-                }
             }
         }
     }
@@ -377,7 +285,7 @@ impl Config {
                                 "vocab_size",
                                 value
                                     .parse::<usize>()
-                                    .expect(&format_parsing_error_message(key, &value)),
+                                    .expect(&format_parsing_error_message(key, value.as_str())),
                             );
                         } else {
                             eprintln!("No key named '{}' found in config", ARRAY_LENGTH_KEY);
@@ -411,22 +319,24 @@ impl Config {
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
-pub fn rmsnorm(x: &mut [f32], weight: &[f32], size: usize) {
+pub fn rmsnorm(mut x: Vec<f32>, weight: &[f32], size: usize) -> Vec<f32> {
     // calculate sum of squares
     // iterator enables auto-vectorization
-    let ss = x[..size].iter().map(|&v| v * v).sum::<f32>() / size as f32 + 1e-6;
+    let ss = x.iter().map(|&v| v * v).sum::<f32>() / size as f32 + 1e-6;
     let scale = 1.0 / ss.sqrt();
 
     // normalize and scale
     // in-place for cache efficiency
-    for j in 0..size {
+    for j in 0..size.min(x.len()) {
         x[j] *= scale * weight[j];
     }
+    x.truncate(size);
+    x
 }
 
-pub fn softmax(x: &mut [f32], size: usize) {
+pub fn softmax(mut x: Vec<f32>, size: usize) -> Vec<f32> {
     // find max value (for numerical stability)
-    let max_val = x[..size]
+    let max_val = x
         .iter()
         .max_by(|a, b| a.total_cmp(b))
         .copied()
@@ -435,43 +345,36 @@ pub fn softmax(x: &mut [f32], size: usize) {
     // exp and sum
     // TODO: what about this? how does an iterator-based approach compare
     // x = x.iter().map(|c| (c - max_val).exp()).collect();
-    for i in 0..size {
+    for i in 0..size.min(x.len()) {
         x[i] = (x[i] - max_val).exp();
     }
-    let sum = x[..size].iter().sum::<f32>();
+    let sum = x.iter().sum::<f32>();
 
     // normalize
-    for i in 0..size {
+    for i in 0..size.min(x.len()) {
         x[i] /= sum;
     }
+    x.truncate(size);
+    x
 }
 
-pub fn matmul(xout: &mut [f32], x: &[f32], w: &[f32], n: usize, d: usize) {
+pub fn matmul(x: &[f32], w: &[f32], n: usize, d: usize) -> Vec<f32> {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     // TODO:
     // the C version parallelizes using OpenMP via
     // #pragma omp parallel for private(i)
     // figure out how to do this in Rust
-    //
-    // .par_iter_mut() is Rust's equivalent of OpenMP's parallel for!
-    // it automatically divides work across CPU cores
-    xout[..d]
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(i, out_val)| {
-            let mut val = 0.0_f32;
 
-            // grab the specific row of weights for this iteration
-            // (helps the compiler remove bounds checks inside the hot loop)
-            let w_row = &w[i * n..i * n + n];
-
-            for j in 0..n {
-                val += w_row[j] * x[j];
-            }
-
-            *out_val = val;
-        });
+    let mut xout = vec![0.0_f32; d];
+    for i in 0..d {
+        let mut val = 0.0_f32;
+        for j in 0..n {
+            val += w[i * n + j] * x[j];
+        }
+        xout[i] = val;
+    }
+    xout
 }
 
 fn main() {
