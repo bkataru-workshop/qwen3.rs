@@ -190,7 +190,7 @@ impl Transformer {
         }
     }
 
-    pub fn forward(&mut self, token: usize, pos: usize) {
+    pub fn forward(&mut self, token: usize, pos: usize) -> Box<[f32]> {
         let config = &self.config;
         let weights = &self.weights;
         let state = &mut self.state;
@@ -278,7 +278,123 @@ impl Transformer {
                     }
                 }
             }
+
+            // multihead attention. iterate over all heads
+            // parallelized across query heads
+            let head_dim = config.head_dim;
+            let seq_len = config.seq_len;
+            let head_dim_sqrt = (head_dim as f32).sqrt();
+
+            // Rebind references so Rayon closures only capture the needed slices
+            let key_cache = &state.key_cache;
+            let value_cache = &state.value_cache;
+
+            state
+                .q
+                .par_chunks(head_dim)
+                .zip(state.att.par_chunks_mut(seq_len))
+                .zip(state.xb3.par_chunks_mut(head_dim))
+                .enumerate()
+                .for_each(|(h, ((q_head, att_head), xb3_head))| {
+                    let kv_head = h / kv_mul;
+                    let kv_head_offset = kv_head * head_dim;
+
+                    // calculate attention scores: dot product of Q and K for timesteps 0..=pos
+                    for t in 0..=pos {
+                        let k_offset = loff + t * kv_dim + kv_head_offset;
+                        let k_head = &key_cache[k_offset..k_offset + head_dim];
+
+                        let score: f32 = q_head.iter().zip(k_head).map(|(q, k)| q * k).sum();
+                        att_head[t] = score / head_dim_sqrt;
+                    }
+
+                    // softmax the scores to get attention weights, from 0..=pos
+                    softmax(att_head, pos + 1);
+
+                    // weighted sum of the values, store back into xb3
+                    xb3_head.fill(0.0);
+                    for t in 0..=pos {
+                        let v_offset = loff + t * kv_dim + kv_head_offset;
+                        // get the value vector for this head and at this timestep
+                        let v_head = &value_cache[v_offset..v_offset + head_dim];
+                        // get the attention weight for this timestep
+                        let a = att_head[t];
+                        // accumulate the weighted value into xb3
+                        for i in 0..head_dim {
+                            xb3_head[i] += a * v_head[i];
+                        }
+                    }
+                });
+
+            // output projection
+            matmul(
+                &mut state.xb2,
+                &state.xb3,
+                &weights.wo[w_off..],
+                att_head_dim,
+                config.dim,
+            );
+
+            // residual connection back into state.x
+            for i in 0..config.dim {
+                state.x[i] += state.xb2[i];
+            }
+
+            // ffn rmsnorm
+            state.xb.copy_from_slice(&state.x);
+            rmsnorm(&mut state.xb, &weights.rms_ffn_weight[w_off..], config.dim);
+
+            matmul(
+                &mut state.hb,
+                &state.xb,
+                &weights.w1[w_off..],
+                config.dim,
+                config.hidden_dim,
+            );
+            matmul(
+                &mut state.hb2,
+                &state.xb,
+                &weights.w3[w_off..],
+                config.dim,
+                config.hidden_dim,
+            );
+
+            // SwiGLU non-linearity
+            for i in 0..config.hidden_dim {
+                let val = state.hb2[i];
+                // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+                let silu = val * (1.0 / (1.0 + (-val).exp()));
+                state.hb2[i] = silu * state.hb[i]; // elementwise multiply with w3(x)
+            }
+
+            // matmul to get the final ffn output
+            // quantize(&state.hq, state.hb, config.hidden_dim);
+            matmul(
+                &mut state.xb,
+                &state.hb2,
+                &weights.w2[w_off..],
+                config.hidden_dim,
+                config.dim,
+            );
+
+            // residual connection
+            for i in 0..config.dim {
+                state.x[i] += state.xb[i];
+            }
         }
+
+        // rmsnorm right before logiting
+        rmsnorm(&mut state.x, &weights.rms_final_weight, config.dim);
+
+        matmul(
+            &mut state.logits,
+            &state.x,
+            &weights.wcls,
+            config.dim,
+            config.vocab_size,
+        );
+
+        state.logits.clone()
     }
 }
 
